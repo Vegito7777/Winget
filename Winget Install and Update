@@ -1,0 +1,204 @@
+# Set the Prerequisites Path directly
+$PrerequisitesPath = "C:\RMM\Prerequisites\"
+
+# Test Prerequisite Path and create if it doesn't exist
+If (!(Test-Path $PrerequisitesPath)) {
+    Write-Host "Creating prerequisites directory at $PrerequisitesPath."
+    New-Item -ItemType Directory -Force -Path $PrerequisitesPath
+}
+
+# Prerequisite test function - checks if the script can run.
+function Test-WinGetPrerequisites {
+    # Check if the script is running in a supported OS.
+    if ([System.Environment]::OSVersion.Version.Build -lt 17763) {
+        Write-Host "Unsupported OS version. The script requires Windows 10 version 1809 or later." -ForegroundColor Red
+        exit 1
+    }
+
+    # Check for the required Microsoft Visual C++ redistributables.
+    $Visual2019 = 'Microsoft Visual C++ 2015-2019 Redistributable*'
+    $Visual2022 = 'Microsoft Visual C++ 2015-2022 Redistributable*'
+    $VCPPInstalled = Get-Item @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') | Where-Object {
+        $_.GetValue('DisplayName') -like $Visual2019 -or $_.GetValue('DisplayName') -like $Visual2022
+    }
+
+    if (!($VCPPInstalled)) {
+        Write-Host "Required Microsoft Visual C++ Redistributable not found. Installing..." -ForegroundColor Yellow
+
+        if ([System.Environment]::Is64BitOperatingSystem) {
+            $OSArch = 'x64'
+        } else {
+            $OSArch = 'x86'
+        }
+        $VCPPRedistURL = ('https://aka.ms/vs/17/release/vc_redist.{0}.exe' -f $OSArch)
+        $VCPPRedistFileName = [Uri]$VCPPRedistURL | Select-Object -ExpandProperty Segments | Select-Object -Last 1
+        $VCPPRedistDownloadFile = Join-Path -Path $PrerequisitesPath -ChildPath $VCPPRedistFileName
+
+        try {
+            (New-Object System.Net.WebClient).DownloadFile($VCPPRedistURL, $VCPPRedistDownloadFile)
+            Start-Process -FilePath $VCPPRedistDownloadFile -ArgumentList '/quiet', '/norestart' -Wait -ErrorAction Stop | Out-Null
+            Write-Host "Microsoft Visual C++ Redistributable installed successfully." -ForegroundColor Green
+        } catch {
+            Write-Host "Failed to install Microsoft Visual C++ Redistributable. Exiting script." -ForegroundColor Red
+            exit 1
+        }
+    } else {
+        Write-Host "Required Microsoft Visual C++ Redistributable is already installed." -ForegroundColor Green
+    }
+}
+
+# Run the prerequisites test before proceeding
+Test-WinGetPrerequisites
+
+# Function to install WinGet using the MSIX bundle from GitHub.
+function Install-WinGetFromMSIX {
+    param (
+        [string]$WinGetURL,
+        [string]$PrerequisitesPath
+    )
+
+    if (-not $WinGetURL) {
+        Write-Host "No valid WinGet download URL provided." -ForegroundColor Red
+        return
+    }
+
+    # Extract the file name directly from the URL
+    $WinGetFileName = $WinGetURL.Split('/')[-1]
+
+    # Debug: Show the extracted file name
+    Write-Host "Extracted WinGet file name: $WinGetFileName"
+
+    # Ensure the file name is not empty
+    if (-not $WinGetFileName) {
+        Write-Host "Failed to extract file name from URL: $WinGetURL" -ForegroundColor Red
+        return
+    }
+
+    $WinGetDownloadPath = Join-Path -Path $PrerequisitesPath -ChildPath $WinGetFileName
+
+    # Debug: Show the full download path
+    Write-Host "WinGet will be downloaded to: $WinGetDownloadPath"
+
+    try {
+        Write-Host "Downloading WinGet from $WinGetURL to $WinGetDownloadPath."
+        Invoke-WebRequest -Uri $WinGetURL -OutFile $WinGetDownloadPath
+        Write-Host "Downloaded WinGet successfully. Installing..."
+
+        # Verify that the file was downloaded
+        if (-not (Test-Path $WinGetDownloadPath)) {
+            Write-Host "Download failed: File not found at $WinGetDownloadPath" -ForegroundColor Red
+            return
+        }
+
+        # Install the package for all users
+        Add-AppxProvisionedPackage -Online -PackagePath $WinGetDownloadPath -SkipLicense -ErrorAction Stop | Out-Null
+
+        Write-Host "WinGet installed successfully."
+    } catch {
+        Write-Host "Failed to download or install WinGet: $_" -ForegroundColor Red
+    } finally {
+        if (Test-Path $WinGetDownloadPath) {
+            Write-Host "Removing downloaded file $WinGetDownloadPath."
+            Remove-Item -Path $WinGetDownloadPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# Get latest WinGet function - gets the latest WinGet version and the download URL for the MSIXBundle from GitHub.
+function Get-LatestWinGet {
+    $LatestRelease = Invoke-RestMethod -Uri 'https://api.github.com/repos/microsoft/winget-cli/releases/latest' -Method Get 
+    $LatestWinGetVersion = [version]$LatestRelease.tag_name.TrimStart('v')
+    $LatestVersion = @{
+        Version = $LatestWinGetVersion
+        DownloadURI = $LatestRelease.assets.browser_download_url | Where-Object { $_.EndsWith('.msixbundle') }
+    }
+    return $LatestVersion
+}
+
+# Function to test WinGet version.
+function Test-WinGetVersion {
+    param(
+        [version]$InstalledWinGetVersion,
+        [version]$LatestWinGetVersion
+    )
+
+    if ($InstalledWinGetVersion -lt $LatestWinGetVersion) {
+        Write-Host 'WinGet is out of date.'
+        return $false
+    } else {
+        Write-Host 'WinGet is up to date.'
+        return $true
+    }
+}
+
+# Resolve Winget path
+$WingetExe = "$Env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe"
+$WingetPath = Get-Command winget -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue
+
+if (-not $WingetPath -or -not (Test-Path $WingetPath)) {
+    Write-Host "WinGet is not installed. Proceeding to install it..."
+    # Call Get-LatestWinGet to get the download URL and install WinGet
+    $LatestWinGet = Get-LatestWinGet
+    Install-WinGetFromMSIX -WinGetURL $LatestWinGet.DownloadURI -PrerequisitesPath $PrerequisitesPath
+
+    # After installation, introduce a delay to allow the system to register the installation
+    Start-Sleep -Seconds 5
+
+    # Recheck the WinGet path after installation
+    $WingetExePath = "$Env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe"
+
+    Start-Sleep -Seconds 5  # Give time for the system to recognize the installation
+
+    if (Test-Path $WingetExePath) {
+        Write-Host "WinGet installed successfully"
+    } else {
+        Write-Host "Failed to install WinGet. Please check the installation."
+        return $false
+    }
+} 
+
+# Capture the output of winget --version
+try {
+    $InstalledWinGetVersion = [version](& $WingetExe --version).TrimStart('v')
+} catch {
+    Write-Host "Failed to retrieve WinGet version: $_" -ForegroundColor Red
+    return $false
+}
+
+# Get the latest WinGet version from GitHub
+$LatestWinGet = Get-LatestWinGet
+
+# Test WinGet version
+$IsWinGetUpToDate = Test-WinGetVersion -InstalledWinGetVersion $InstalledWinGetVersion -LatestWinGetVersion $LatestWinGet.Version
+
+# If WinGet is out of date, call Install-WinGetFromMSIX
+if (-not $IsWinGetUpToDate) {
+    Install-WinGetFromMSIX -WinGetURL $LatestWinGet.DownloadURI -PrerequisitesPath $PrerequisitesPath
+    
+    # Introduce a delay to allow the update to register
+    Start-Sleep -Seconds 5
+
+    # Redirect output to a temporary file
+    $TempOutputFile = [System.IO.Path]::GetTempFileName()
+    
+    # Start a new process to check the version, redirecting output
+    Start-Process -FilePath $WingetExe -ArgumentList "--version" -NoNewWindow -RedirectStandardOutput $TempOutputFile -Wait
+    
+    # Read the output from the temporary file
+    $Output = Get-Content $TempOutputFile
+    
+    # Clean up the temporary file
+    Remove-Item $TempOutputFile
+    
+    # Extract and convert the version from the output
+    $InstalledWinGetVersion = [version]($Output.Trim().Replace("v",""))
+
+    # Check if WinGet updated to the latest version
+    if ($InstalledWinGetVersion -eq $LatestWinGet.Version) {
+        Write-Host "WinGet successfully updated to version $InstalledWinGetVersion."
+        return $true
+    } else {
+        Write-Host "Failed to update WinGet to version $($LatestWinGet.Version). Current version is $InstalledWinGetVersion."
+        return $false
+    }
+}
